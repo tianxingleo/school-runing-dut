@@ -1,0 +1,26 @@
+# 1. 操作系统/编辑器文件
+.DS_Store
+.vscode/
+
+# 2. 虚拟环境（Virtual Environment）
+# 常见的虚拟环境名称
+venv/
+env/
+
+# 3. Python 缓存文件和编译产物
+__pycache__/
+*.pyc
+*.pyd
+
+# 4. PyInstaller/打包产物
+# 忽略 PyInstaller 的配置文件、构建目录和最终产物
+*.spec
+build/
+dist/
+
+# 5. 测试和临时文件
+.pytest_cache/
+
+# 6. 数据和日志（如果您不希望版本控制这些）
+*.log
+*.sqlite

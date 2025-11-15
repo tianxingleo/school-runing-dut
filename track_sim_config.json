@@ -3,6 +3,10 @@
     "offset_ns": "0.0",
     "offset_ew": "0.0",
     "last_preset": "\u5927\u8fde\u64cd\u573a (\u4fee\u6b63\u540e)",
+    "last_known_location": [
+        39.08622198863057,
+        121.80852599029832
+    ],
     "use_random_offset": true,
     "random_offset_chance": "20",
     "random_offset_range": "1.5",
