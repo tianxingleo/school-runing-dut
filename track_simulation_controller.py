@@ -17,10 +17,11 @@ CONFIG_FILE = "track_sim_config.json"
 # (新) 预设坐标
 PRESETS = {
     "大连操场 (修正后)": {
-        # (新) 根据 -5m N/S, -21m E/W 再次修正
-        'p1_lat': '39.084957', 'p1_lon': '121.808712',
+        # (新) 根据 -5m N/S, -21m E/W 修正
+        # (新) 同时将直道 (P2->P3, P4->P1) 缩短4米
+        'p1_lat': '39.084957', 'p1_lon': '121.808666', # 经度 -4m
         'p2_lat': '39.085892', 'p2_lon': '121.808713',
-        'p3_lat': '39.085893', 'p3_lon': '121.807840',
+        'p3_lat': '39.085893', 'p3_lon': '121.807886', # 经度 +4m
         'p4_lat': '39.084957', 'p4_lon': '121.807847',
         'offset_ns': '0.0', # 已修正，偏移归零
         'offset_ew': '0.0'
@@ -68,8 +69,8 @@ def calculate_midpoint(point_a: Point, point_b: Point) -> Point:
 
 def interpolate_straight(p1: Point, p2: Point, step_meters: float) -> (list, float):
     """
-    在两个点之间生成直线路径点。
-    返回 (点列表[Point], 总长度)。
+    (新) 在两个点之间生成直线路径点。
+    返回 (点列表[(Point, bearing)], 总长度)。
     """
     points = []
     total_distance = geodesic(p1, p2).meters
@@ -80,15 +81,14 @@ def interpolate_straight(p1: Point, p2: Point, step_meters: float) -> (list, flo
     for i in range(num_steps):
         dist = i * step_meters
         new_point = geodesic(meters=dist).destination(point=p1, bearing=bearing)
-        points.append(new_point)
-    points.append(p2)
+        points.append((new_point, bearing)) # (新) 存储 (点, 方向)
+    points.append((p2, bearing)) # (新) 存储 (点, 方向)
     return points, total_distance
 
 def interpolate_arc(p_start: Point, p_end: Point, step_meters: float, arc_degrees_total: float) -> (list, float):
     """
     (新) 重写了圆弧插值函数，支持自定义角度。
-    在两个点之间生成指定角度的圆弧路径点。
-    返回 (点列表[Point], 总长度)。
+    返回 (点列表[(Point, bearing)], 总长度)。
     """
     points = []
     
@@ -137,13 +137,18 @@ def interpolate_arc(p_start: Point, p_end: Point, step_meters: float, arc_degree
     # 7. 循环插值
     angle_step = arc_degrees_total / num_steps
     
+    last_travel_bearing = 0
     for i in range(num_steps):
         # 顺时针旋转 (保持 "向外凸")
         current_bearing = (start_bearing - i * angle_step + 360) % 360
         new_point = geodesic(meters=radius).destination(point=true_center, bearing=current_bearing)
-        points.append(new_point)
         
-    points.append(p_end)
+        # (新) 行进方向是圆弧切线方向 (半径方向 - 90度)
+        travel_bearing = (current_bearing - 90 + 360) % 360
+        points.append((new_point, travel_bearing))
+        last_travel_bearing = travel_bearing
+        
+    points.append((p_end, last_travel_bearing)) # (新) 存储 (点, 方向)
     return points, arc_length
 
 
@@ -154,13 +159,12 @@ def interpolate_arc(p_start: Point, p_end: Point, step_meters: float, arc_degree
 # 用于通知线程停止/暂停的事件
 stop_simulation_event = threading.Event()
 pause_event = threading.Event() # 用于暂停
-skip_wait_event = threading.Event() # (新) 用于立即跳过等待
+skip_wait_event = threading.Event() # 用于立即跳过等待
 
-def run_simulation_thread(status_queue, ld_folder_path, emulator_index, points_list, pace_info, step_m):
+def run_simulation_thread(status_queue, ld_folder_path, emulator_index, points_list, pace_info, step_m, random_offset_info):
     """
     在单独的线程中运行模拟。
     仅使用 dnconsole/ldconsole。
-    (新) pace_info 可以是 float (delay) 或 tuple (min_pace, max_pace)
     """
     
     try:
@@ -182,7 +186,6 @@ def run_simulation_thread(status_queue, ld_folder_path, emulator_index, points_l
             if not os.path.exists(console_exe_path):
                 raise FileNotFoundError(f"在目录中未找到 dnconsole.exe 或 ldconsole.exe: {ld_folder_path}")
         
-        # (新) 检查是否从 Checkbox 跳过
         initial_skip = skip_wait_event.is_set()
         
         if not initial_skip:
@@ -211,8 +214,35 @@ def run_simulation_thread(status_queue, ld_folder_path, emulator_index, points_l
         
         status_queue.put(("STATUS", "连接成功，即将开始模拟...", "blue"))
         
+        # (新) 平滑速度逻辑
+        # pace_info: (const_delay) OR ("smooth", base_pace, variability, smoothness)
+        
         # --- 循环发送 locate 命令 ---
-        for i, point in enumerate(points_list):
+        
+        current_pace = 6.0 # 默认值
+        target_pace = 6.0
+        min_pace = 5.5
+        max_pace = 6.5
+        smooth_steps = 30 # 默认值
+        is_smooth = False
+        
+        if isinstance(pace_info, tuple) and pace_info[0] == "smooth":
+            is_smooth = True
+            _, base_pace, variability, smoothness = pace_info
+            current_pace = base_pace
+            target_pace = base_pace
+            min_pace = base_pace - variability
+            max_pace = base_pace + variability
+            # 计算达到目标配速需要的 *点* 数 (非秒)
+            avg_delay = step_m / (1000.0 / (base_pace * 60.0))
+            smooth_steps = max(1, int(smoothness / avg_delay)) # 至少1步
+        else:
+            const_delay = pace_info # 它是恒定的 delay_seconds
+
+        loop_start_time = time.time()
+        
+        # (新) 循环解包 (点, 方向)
+        for i, (point, travel_bearing) in enumerate(points_list):
             # 1. 检查是否需要停止
             if stop_simulation_event.is_set():
                 status_queue.put(("STATUS", "模拟已手动停止。", "orange"))
@@ -221,17 +251,37 @@ def run_simulation_thread(status_queue, ld_folder_path, emulator_index, points_l
             # 2. 检查是否需要暂停
             pause_event.wait() # 如果 pause_event 被 clear(), 线程将在此阻塞
             
-            # (新) 动态计算延迟
-            if isinstance(pace_info, tuple):
-                min_pace, max_pace = pace_info
-                current_pace = random.uniform(min_pace, max_pace)
+            # 3. (新) 动态计算延迟
+            if is_smooth:
+                # 每 N 步更新一次目标
+                if i % smooth_steps == 0:
+                    target_pace = random.uniform(min_pace, max_pace)
+                
+                # 逐渐接近目标 (简单的指数平滑)
+                current_pace = current_pace * 0.98 + target_pace * 0.02
+                
                 current_speed_ms = 1000.0 / (current_pace * 60.0)
                 delay = step_m / current_speed_ms
             else:
-                delay = pace_info # 它是恒定的 delay_seconds
+                delay = const_delay # 恒定延迟
+            
+            # 4. (新) 应用 *定向* 随机偏移
+            final_point = point # 基础点
+            if random_offset_info:
+                chance_pct, max_range_m = random_offset_info
+                # 只有 X% 的几率会偏移
+                if random.random() < chance_pct:
+                    # (新) 随机一个向左或向右的偏移距离 (-max .. +max)
+                    offset_dist = random.uniform(-max_range_m, max_range_m) 
+                    
+                    # (新) 计算 "向右" 的方位角 (与行进方向垂直)
+                    lateral_bearing = (travel_bearing + 90 + 360) % 360
+                    
+                    # 计算新点
+                    final_point = geodesic(meters=offset_dist).destination(point=point, bearing=lateral_bearing)
 
-            lon = point.longitude
-            lat = point.latitude
+            lon = final_point.longitude
+            lat = final_point.latitude
             
             # 准备 LLI 参数: <Lng,Lat>
             lli_arg = f"{lon},{lat}"
@@ -247,14 +297,19 @@ def run_simulation_thread(status_queue, ld_folder_path, emulator_index, points_l
             # 执行 GPS 命令
             subprocess.run(command, startupinfo=startupinfo, capture_output=True, text=True, encoding='utf-8')
             
-            # 3. 更新GUI
+            # 5. 更新GUI
             if i % 10 == 0: 
                 progress = f"正在模拟: {i+1} / {total_points} 个点"
                 coords = f"当前坐标: {lat:.6f}, {lon:.6f}"
                 status_queue.put(("UPDATE", progress, coords))
             
-            # 4. 等待
-            time.sleep(delay)
+            # 6. 等待
+            # (新) 精确计时，防止 time.sleep() 累积误差
+            loop_end_time = loop_start_time + delay
+            sleep_time = loop_end_time - time.time()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            loop_start_time = time.time() # 更新下一个循环的开始时间
 
         # ... (循环结束) ...
         if not stop_simulation_event.is_set():
@@ -277,7 +332,7 @@ class TrackSimulatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("操场实时模拟控制器 (Tkinter版)")
-        self.root.geometry("550x760") # (新) 窗口加高
+        self.root.geometry("550x850") # (新) 窗口加高
         
         self.simulation_thread = None
         self.status_queue = queue.Queue() # 线程通信队列
@@ -317,7 +372,7 @@ class TrackSimulatorApp:
         self.preset_menu.bind("<<ComboboxSelected>>", self.on_preset_select)
         
         # 3. 坐标输入
-        self.coords_frame = ttk.Labelframe(main_frame, text="坐标 (逆时针 WGS-84)", padding="5")
+        self.coords_frame = ttk.Labelframe(main_frame, text="坐标 (WGS-84)", padding="5")
         self.coords_frame.pack(fill="x", expand=True, pady=5)
         
         self.coord_entries = {}
@@ -354,40 +409,44 @@ class TrackSimulatorApp:
         self.total_dist_m = tk.StringVar(value="10000")
         ttk.Entry(params_frame, textvariable=self.total_dist_m, width=10).grid(row=0, column=1, padx=5, pady=5)
         
-        # (新) 随机配速 Checkbox
-        self.random_pace_var = tk.BooleanVar(value=False)
-        self.random_pace_check = ttk.Checkbutton(params_frame, text="随机配速", variable=self.random_pace_var, command=self.toggle_pace_entries)
-        self.random_pace_check.grid(row=0, column=2, sticky="w", padx=10, pady=5)
-        
         ttk.Label(params_frame, text="路径点间距 (米):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.step_m = tk.StringVar(value="1.0")
         ttk.Entry(params_frame, textvariable=self.step_m, width=10).grid(row=1, column=1, padx=5, pady=5)
         
         # (新) 圆弧调节
         ttk.Label(params_frame, text="圆弧角度 (度):").grid(row=1, column=2, sticky="w", padx=5, pady=5)
-        self.arc_degrees = tk.StringVar(value="180.0") # 180 = 完美半圆
+        self.arc_degrees = tk.StringVar(value="170.0") # (新) 默认 170
         ttk.Entry(params_frame, textvariable=self.arc_degrees, width=10).grid(row=1, column=3, padx=5, pady=5)
         
+        # (新) 平滑配速
+        pace_smooth_frame = ttk.Labelframe(main_frame, text="平滑配速 (反作弊)", padding="5")
+        pace_smooth_frame.pack(fill="x", expand=True, pady=5)
+        
+        self.random_pace_var = tk.BooleanVar(value=False)
+        self.random_pace_check = ttk.Checkbutton(pace_smooth_frame, text="启用平滑配速", variable=self.random_pace_var, command=self.toggle_pace_entries)
+        self.random_pace_check.grid(row=0, column=0, sticky="w", padx=10, pady=5)
+        
         # (新) 配速输入
-        ttk.Label(params_frame, text="配速 (分钟/公里):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        ttk.Label(pace_smooth_frame, text="基础配速 (分钟/公里):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
         self.pace_minkm = tk.StringVar(value="6.0")
-        self.pace_entry = ttk.Entry(params_frame, textvariable=self.pace_minkm, width=10)
-        self.pace_entry.grid(row=2, column=1, padx=5, pady=5)
+        self.pace_entry = ttk.Entry(pace_smooth_frame, textvariable=self.pace_minkm, width=10)
+        self.pace_entry.grid(row=1, column=1, padx=5, pady=5)
         
         # (新) 随机配速范围
-        ttk.Label(params_frame, text="最小:").grid(row=3, column=0, sticky="e", padx=5, pady=5)
-        self.min_pace_var = tk.StringVar(value="5.5")
-        self.min_pace_entry = ttk.Entry(params_frame, textvariable=self.min_pace_var, width=10)
-        self.min_pace_entry.grid(row=3, column=1, padx=5, pady=5)
+        ttk.Label(pace_smooth_frame, text="变异率 (± min/km):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self.variability_var = tk.StringVar(value="0.2")
+        self.variability_entry = ttk.Entry(pace_smooth_frame, textvariable=self.variability_var, width=10)
+        self.variability_entry.grid(row=2, column=1, padx=5, pady=5)
         
-        ttk.Label(params_frame, text="最大:").grid(row=3, column=2, sticky="w", padx=5, pady=5)
-        self.max_pace_var = tk.StringVar(value="6.5")
-        self.max_pace_entry = ttk.Entry(params_frame, textvariable=self.max_pace_var, width=10)
-        self.max_pace_entry.grid(row=3, column=3, padx=5, pady=5)
+        ttk.Label(pace_smooth_frame, text="变化平滑度 (秒):").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        self.smoothness_var = tk.StringVar(value="30")
+        self.smoothness_entry = ttk.Entry(pace_smooth_frame, textvariable=self.smoothness_var, width=10)
+        self.smoothness_entry.grid(row=3, column=1, padx=5, pady=5)
+
 
         # 5. 路径微调
         offset_frame = ttk.Labelframe(main_frame, text="路径微调 (偏移)", padding="5")
-        offset_frame.pack(fill="x", expand=True, pady=(0, 10))
+        offset_frame.pack(fill="x", expand=True, pady=(0, 5))
 
         ttk.Label(offset_frame, text="北/南 偏移 (米):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
         self.offset_ns = tk.StringVar(value="0.0")
@@ -401,7 +460,26 @@ class TrackSimulatorApp:
         self.offset_ew_entry.grid(row=1, column=1, padx=5, pady=5)
         ttk.Label(offset_frame, text="(正数向东, 负数向西)").grid(row=1, column=2, sticky="w", padx=5, pady=5)
 
-        # 6. 控制按钮
+        # 6. (新) 随机偏移 (GPS 噪声)
+        random_frame = ttk.Labelframe(main_frame, text="随机偏移 (GPS 噪声)", padding="5")
+        random_frame.pack(fill="x", expand=True, pady=(0, 10))
+        
+        self.random_offset_var = tk.BooleanVar(value=False)
+        self.random_offset_check = ttk.Checkbutton(random_frame, text="启用随机偏移", variable=self.random_offset_var, command=self.toggle_random_offset_entries)
+        self.random_offset_check.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+
+        ttk.Label(random_frame, text="偏移几率 (%):").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self.random_offset_chance = tk.StringVar(value="20")
+        self.random_offset_chance_entry = ttk.Entry(random_frame, textvariable=self.random_offset_chance, width=10)
+        self.random_offset_chance_entry.grid(row=1, column=1, padx=5, pady=5)
+        
+        # (新) 标签修改
+        ttk.Label(random_frame, text="左/右最大偏移 (米):").grid(row=1, column=2, sticky="w", padx=5, pady=5)
+        self.random_offset_range = tk.StringVar(value="1.5")
+        self.random_offset_range_entry = ttk.Entry(random_frame, textvariable=self.random_offset_range, width=10)
+        self.random_offset_range_entry.grid(row=1, column=3, padx=5, pady=5)
+
+        # 7. 控制按钮
         button_frame = ttk.Frame(main_frame, padding="5")
         button_frame.pack(fill="x", expand=True)
         
@@ -418,7 +496,7 @@ class TrackSimulatorApp:
         self.skip_wait_button = ttk.Button(button_frame, text="跳过等待", command=self.skip_wait_now, state=tk.DISABLED)
         self.skip_wait_button.pack(side=tk.LEFT, fill="x", expand=True, padx=5)
         
-        # 7. 状态显示
+        # 8. 状态显示
         status_frame = ttk.Labelframe(main_frame, text="状态", padding="5")
         status_frame.pack(fill="both", expand=True, pady=10)
         
@@ -439,6 +517,9 @@ class TrackSimulatorApp:
         # (新) 初始化随机配速框
         self.toggle_pace_entries()
         
+        # (新) 初始化随机偏移框
+        self.toggle_random_offset_entries()
+        
         # 退出时停止线程
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
@@ -449,14 +530,23 @@ class TrackSimulatorApp:
     def toggle_pace_entries(self):
         if self.random_pace_var.get():
             # 启用随机, 禁用固定
-            self.pace_entry.config(state=tk.DISABLED)
-            self.min_pace_entry.config(state=tk.NORMAL)
-            self.max_pace_entry.config(state=tk.NORMAL)
+            self.pace_entry.config(state=tk.NORMAL) # 基础配速保持可用
+            self.variability_entry.config(state=tk.NORMAL)
+            self.smoothness_entry.config(state=tk.NORMAL)
         else:
             # 禁用随机, 启用固定
             self.pace_entry.config(state=tk.NORMAL)
-            self.min_pace_entry.config(state=tk.DISABLED)
-            self.max_pace_entry.config(state=tk.DISABLED)
+            self.variability_entry.config(state=tk.DISABLED)
+            self.smoothness_entry.config(state=tk.DISABLED)
+
+    # (新) 切换随机偏移输入框
+    def toggle_random_offset_entries(self):
+        if self.random_offset_var.get():
+            self.random_offset_chance_entry.config(state=tk.NORMAL)
+            self.random_offset_range_entry.config(state=tk.NORMAL)
+        else:
+            self.random_offset_chance_entry.config(state=tk.DISABLED)
+            self.random_offset_range_entry.config(state=tk.DISABLED)
 
     # (新) 选择预设时调用
     def on_preset_select(self, event):
@@ -520,11 +610,12 @@ class TrackSimulatorApp:
             # (新) 动态计算 pace_info
             pace_info = None
             if self.random_pace_var.get():
-                min_pace = float(self.min_pace_var.get())
-                max_pace = float(self.max_pace_var.get())
-                if min_pace <= 0 or max_pace <= 0 or max_pace < min_pace:
-                    raise Exception("随机配速范围无效。")
-                pace_info = (min_pace, max_pace)
+                base_pace = float(self.pace_minkm.get()) # (新) 基础配速
+                variability = float(self.variability_var.get()) # (新) 变异率
+                smoothness = float(self.smoothness_var.get()) # (新) 平滑度
+                if base_pace <= 0 or variability < 0 or smoothness <= 0:
+                    raise Exception("平滑配速参数无效。")
+                pace_info = ("smooth", base_pace, variability, smoothness)
             else:
                 pace_minkm = float(self.pace_minkm.get())
                 if pace_minkm <= 0:
@@ -538,13 +629,24 @@ class TrackSimulatorApp:
             arc_degrees = float(self.arc_degrees.get())
             if arc_degrees <= 0 or arc_degrees >= 360:
                 raise Exception("圆弧角度必须在 0 和 360 度之间。")
+            
+            # (新) 获取随机偏移
+            random_offset_info = None
+            if self.random_offset_var.get():
+                chance = float(self.random_offset_chance.get())
+                range_m = float(self.random_offset_range.get())
+                if chance <= 0 or chance > 100 or range_m <= 0:
+                    raise Exception("随机偏移参数无效")
+                random_offset_info = (chance / 100.0, range_m) # 转换
 
             if total_dist_m <= 0:
                 raise Exception("总距离必须 > 0")
             
             self.status_label.config(text=f"正在计算单圈路径...", foreground="blue")
 
-            # 4. 计算单圈路径点 (传入 arc_degrees)
+            # 4. (新) **恢复为正确的几何**
+            # (P1 -> P2 直道), (P2 -> P3 弯道), (P3 -> P4 直道), (P4 -> P1 弯道)
+            
             s1_points, s1_len = interpolate_straight(p1, p2, step_m)
             a1_points, a1_len = interpolate_arc(p2, p3, step_m, arc_degrees)
             s2_points, s2_len = interpolate_straight(p3, p4, step_m)
@@ -568,10 +670,11 @@ class TrackSimulatorApp:
                 self.root.update_idletasks() 
                 
                 offset_path_points = []
-                for point in full_path_points:
+                # (新) 处理 (point, bearing) 元组
+                for point, bearing in full_path_points:
                     temp_point = geodesic(meters=offset_ns).destination(point, bearing=0)
                     final_point = geodesic(meters=offset_ew).destination(temp_point, bearing=90)
-                    offset_path_points.append(final_point)
+                    offset_path_points.append((final_point, bearing)) # (新) 保持 bearing
                 
                 full_path_points = offset_path_points
             
@@ -584,7 +687,7 @@ class TrackSimulatorApp:
             
             self.simulation_thread = threading.Thread(
                 target=run_simulation_thread,
-                args=(self.status_queue, ld_folder, emu_index, full_path_points, pace_info, step_m),
+                args=(self.status_queue, ld_folder, emu_index, full_path_points, pace_info, step_m, random_offset_info), # (新) 传入
                 daemon=True
             )
             self.simulation_thread.start()
@@ -592,6 +695,7 @@ class TrackSimulatorApp:
         except Exception as e:
             messagebox.showerror("启动失败", f"启动模拟失败:\n{e}")
             self.status_label.config(text=f"失败: {e}", foreground="red")
+            self.reset_gui_state() # (新) 启动失败时重置
 
     def toggle_pause(self):
         """ 切换暂停/继续状态 """
@@ -666,6 +770,18 @@ class TrackSimulatorApp:
                 self.offset_ns.set(data.get("offset_ns", "0.0"))
                 self.offset_ew.set(data.get("offset_ew", "0.0"))
                 self.preset_var.set(data.get("last_preset", "大连操场 (修正后)"))
+                
+                # (新) 加载随机设置
+                self.random_offset_var.set(data.get("use_random_offset", False))
+                self.random_offset_chance.set(data.get("random_offset_chance", "20"))
+                self.random_offset_range.set(data.get("random_offset_range", "1.5"))
+                
+                # (新) 加载配速设置
+                self.random_pace_var.set(data.get("use_random_pace", False))
+                self.pace_minkm.set(data.get("base_pace", "6.0"))
+                self.variability_var.set(data.get("pace_variability", "0.2"))
+                self.smoothness_var.set(data.get("pace_smoothness", "30"))
+
                 self.settings_loaded = True # 标记已加载
         except FileNotFoundError:
             self.preset_menu.current(0) # 配置文件不存在，默认选择第一个
@@ -682,7 +798,17 @@ class TrackSimulatorApp:
                 "ld_folder_path": self.ld_folder_path.get(),
                 "offset_ns": self.offset_ns.get(),
                 "offset_ew": self.offset_ew.get(),
-                "last_preset": self.preset_var.get()
+                "last_preset": self.preset_var.get(),
+                
+                "use_random_offset": self.random_offset_var.get(),
+                "random_offset_chance": self.random_offset_chance.get(),
+                "random_offset_range": self.random_offset_range.get(),
+                
+                # (新) 保存配速设置
+                "use_random_pace": self.random_pace_var.get(),
+                "base_pace": self.pace_minkm.get(),
+                "pace_variability": self.variability_var.get(),
+                "pace_smoothness": self.smoothness_var.get()
             }
             with open(CONFIG_FILE, 'w') as f:
                 json.dump(data, f, indent=4)

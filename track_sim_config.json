@@ -2,5 +2,12 @@
     "ld_folder_path": "E:/run/LDPlayer9",
     "offset_ns": "0.0",
     "offset_ew": "0.0",
-    "last_preset": "\u5927\u8fde\u64cd\u573a (\u4fee\u6b63\u540e)"
+    "last_preset": "\u5927\u8fde\u64cd\u573a (\u4fee\u6b63\u540e)",
+    "use_random_offset": true,
+    "random_offset_chance": "20",
+    "random_offset_range": "1.5",
+    "use_random_pace": true,
+    "base_pace": "3.5",
+    "pace_variability": "0.2",
+    "pace_smoothness": "30"
 }
