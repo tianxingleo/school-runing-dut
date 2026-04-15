@@ -1,11 +1,11 @@
 {
-    "ld_folder_path": "E:/run/LDPlayer9",
+    "ld_folder_path": "D:/run/LDPlayer9",
     "offset_ns": "0.0",
     "offset_ew": "0.0",
     "last_preset": "\u5927\u8fde\u64cd\u573a (\u4fee\u6b63\u540e)",
     "last_known_location": [
-        39.08545182815476,
-        121.80778295721693
+        39.085047,
+        121.808643
     ],
     "use_random_offset": true,
     "random_offset_chance": "20",
